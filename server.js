@@ -5,6 +5,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -20,8 +21,58 @@ app.use((req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next()
 app.use(express.static(PUBLIC_DIR));
 
 const file = name => path.join(DATA_DIR, name);
+let dbPool = null;
+let dbReady = false;
+let persistenceError = '';
+const pendingDbWrites = new Map();
+if (process.env.DATABASE_URL) {
+  dbPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ...(String(process.env.PGSSL || '').toLowerCase() === 'true' ? { ssl: { rejectUnauthorized: false } } : {}),
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+  });
+  dbPool.on('error', err => { persistenceError = err.message; console.error('MERCADO PostgreSQL pool error:', err.message); });
+}
 function readJson(name, fallback) { try { return JSON.parse(fs.readFileSync(file(name), 'utf8')); } catch { return fallback; } }
-function writeJson(name, value) { fs.writeFileSync(file(name), JSON.stringify(value, null, 2)); }
+function writeJson(name, value) {
+  fs.writeFileSync(file(name), JSON.stringify(value, null, 2));
+  if (dbReady && dbPool) {
+    const previous = pendingDbWrites.get(name) || Promise.resolve();
+    const task = previous.catch(() => {}).then(() => dbPool.query(
+      'INSERT INTO mercado_json_store (key, data, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()',
+      [name, JSON.stringify(value)]
+    )).then(() => { persistenceError = ''; }).catch(err => { persistenceError = err.message; console.error(`MERCADO PostgreSQL write failed (${name}):`, err.message); });
+    pendingDbWrites.set(name, task);
+  }
+}
+async function flushJsonToDb(name) {
+  const task = pendingDbWrites.get(name);
+  if (task) { await task; pendingDbWrites.delete(name); }
+  if (dbPool && persistenceError) throw new Error('PostgreSQL persistence error: ' + persistenceError);
+}
+async function initializePersistence() {
+  if (!dbPool) return;
+  await dbPool.query('CREATE TABLE IF NOT EXISTS mercado_json_store (key TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
+  const result = await dbPool.query('SELECT key, data FROM mercado_json_store');
+  const storedKeys = new Set();
+  for (const row of result.rows) {
+    if (typeof row.key === 'string' && /^[a-z0-9_.-]+\.json$/i.test(row.key)) {
+      fs.writeFileSync(file(row.key), JSON.stringify(row.data, null, 2));
+      storedKeys.add(row.key);
+    }
+  }
+  // On the first deployment with DATABASE_URL, preserve any existing local JSON data.
+  for (const name of fs.readdirSync(DATA_DIR).filter(x => /^[a-z0-9_.-]+\.json$/i.test(x) && !storedKeys.has(x))) {
+    let data;
+    try { data = JSON.parse(fs.readFileSync(file(name), 'utf8')); } catch { continue; }
+    await dbPool.query('INSERT INTO mercado_json_store (key, data, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (key) DO NOTHING', [name, JSON.stringify(data)]);
+  }
+  dbReady = true;
+  persistenceError = '';
+  console.log(`MERCADO PostgreSQL persistence ready (${result.rowCount} stored records; local JSON seeded where needed)`);
+}
 function admin(req, res, next) {
   const key = req.get('x-admin-key') || req.query.key;
   if (!process.env.ADMIN_KEY || !key || !safeEq(key, process.env.ADMIN_KEY)) return res.status(401).json({ error: 'Unauthorized' });
@@ -251,6 +302,16 @@ async function telegram(text) {
 const ordersFile = 'orders.json';
 function orderList() { return readJson(ordersFile, []); }
 function saveOrder(o) { const list = orderList(); const i = list.findIndex(x => x.orderId === o.orderId); if (i >= 0) list[i] = {...list[i], ...o}; else list.push(o); writeJson(ordersFile, list.slice(-2000)); }
+async function updateInboxOrder(o) {
+  const visitorId=String(o.visitorId||'').trim();
+  if(!visitorId || !/^[A-Za-z0-9._:-]{8,120}$/.test(visitorId)) return;
+  const all=readJson('inbox.json',[]);
+  const idx=all.findIndex(x=>x.visitorId===visitorId&&x.type==='order'&&x.orderId===o.orderId);
+  const event={visitorId,type:'order',title:'Commande '+o.orderId,message:'Commande '+(o.status||'en attente'),orderId:o.orderId,total:Number(o.totalEUR||o.total||0),paymentMethod:o.paymentMethod||'',status:o.status||'pending',customer:o.customer||{},items:(o.items||[]).map(({id,name,qty})=>({id,name,qty})),createdAt:o.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};
+  if(idx>=0) all[idx]={...all[idx],...event}; else all.push(event);
+  writeJson('inbox.json',all.slice(-10000));
+  await flushJsonToDb('inbox.json');
+}
 function formatOrderMessage(o, test=false) {
   const lines = [test || process.env.CAMERPAY_MODE === 'test' ? '🧪 TEST (ne pas commander chez CJ)' : '🛒 NOUVELLE COMMANDE MERCADO', `Commande: ${o.orderId}`, `Statut: ${o.status || 'en attente de paiement'}`, `Client: ${o.customer?.name || ''}`, `Email: ${o.customer?.email || ''}`, `Téléphone: ${o.customer?.phone || ''}`, o.customer?.alternatePhone ? `Téléphone secondaire: ${o.customer.alternatePhone}` : '', `Adresse: ${o.customer?.address || ''}`, `Quartier: ${o.customer?.neighborhood || ''}`, `Ville: ${o.customer?.city || ''}`, `Repère: ${o.customer?.landmark || ''}`, `Code postal: ${o.customer?.zip || ''}`, `Pays: ${o.customer?.country || ''}`, o.customer?.recipientName ? `Destinataire: ${o.customer.recipientName}` : '', o.customer?.deliveryInstructions ? `Instructions livraison: ${o.customer.deliveryInstructions}` : '', `Total estimé: ${o.totalEUR || o.total || 0} EUR`, 'Produits:'].filter(Boolean);
   for (const it of o.items || []) lines.push(`• ${it.name || it.id} × ${it.qty || 1}\n  CJ pid: ${it.id}\n  Lien CJ: ${it.itemUrl || it.url || `https://cjdropshipping.com/product/${encodeURIComponent(it.id)}.html`}`);
@@ -286,19 +347,29 @@ app.get('/api/inbox', (req,res) => {
   const visitorId=String(req.query.visitorId||'').trim();
   if(!/^[A-Za-z0-9._:-]{8,120}$/.test(visitorId)) return res.status(400).json({ok:false,error:'visitorId invalide'});
   const all=readJson('inbox.json',[]);
-  res.json({ok:true,items:all.filter(x=>x.visitorId===visitorId).slice(-100).reverse().map(({visitorId,...item})=>item)});
+  res.json({ok:true,items:all.filter(x=>x.visitorId===visitorId).slice(-100).reverse().map(({visitorId,customer,items,...item})=>item)});
 });
-app.post('/api/inbox', (req,res) => {
+app.post('/api/inbox', async (req,res) => {
   const b=req.body||{}; const visitorId=String(b.visitorId||'').trim();
   if(!/^[A-Za-z0-9._:-]{8,120}$/.test(visitorId)) return res.status(400).json({ok:false,error:'visitorId invalide'});
   const allowed=new Set(['order','availability']); const type=String(b.type||'');
   if(!allowed.has(type)) return res.status(400).json({ok:false,error:'Type inbox invalide'});
-  const item={visitorId,type,title:String(b.title||'').trim().slice(0,120),message:String(b.message||'').trim().slice(0,300),orderId:String(b.orderId||'').trim().slice(0,80),total:Number.isFinite(Number(b.total))?Number(b.total):0,paymentMethod:String(b.paymentMethod||'').slice(0,60),createdAt:new Date().toISOString()};
+  const clean = v => String(v ?? '').trim().slice(0,500);
+  const customerIn = b.customer && typeof b.customer === 'object' ? b.customer : {};
+  const customer = {
+    name:clean(customerIn.name), email:clean(customerIn.email).toLowerCase(), phone:clean(customerIn.phone),
+    alternatePhone:clean(customerIn.alternatePhone), address:clean(customerIn.address), neighborhood:clean(customerIn.neighborhood),
+    landmark:clean(customerIn.landmark), city:clean(customerIn.city), zip:clean(customerIn.zip),
+    recipientName:clean(customerIn.recipientName), deliveryInstructions:clean(customerIn.deliveryInstructions), country:clean(customerIn.country)
+  };
+  const safeItems = Array.isArray(b.items) ? b.items.slice(0,50).map(it=>({id:clean(it.id).slice(0,120),name:clean(it.name).slice(0,160),qty:Math.max(1,Math.min(50,Math.floor(Number(it.qty)||1)))})) : [];
+  const item={visitorId,type,title:clean(b.title).slice(0,120),message:clean(b.message).slice(0,300),orderId:clean(b.orderId).slice(0,80),total:Number.isFinite(Number(b.total))?Number(b.total):0,paymentMethod:clean(b.paymentMethod).slice(0,60),status:clean(b.status||'pending').slice(0,50),customer,items:safeItems,createdAt:new Date().toISOString()};
   if(!item.title) return res.status(400).json({ok:false,error:'Titre requis'});
-  const all=readJson('inbox.json',[]); all.push(item); writeJson('inbox.json',all.slice(-10000));
+  const all=readJson('inbox.json',[]); const prior=type==='order'&&item.orderId?all.findIndex(x=>x.visitorId===visitorId&&x.type==='order'&&x.orderId===item.orderId):-1; if(prior>=0) all[prior]={...all[prior],...item,customer:Object.keys(customer).some(k=>customer[k])?customer:(all[prior].customer||{}),items:safeItems.length?safeItems:(all[prior].items||[])}; else all.push(item); writeJson('inbox.json',all.slice(-10000));
+  try { await flushJsonToDb('inbox.json'); } catch { return res.status(503).json({ok:false,savedLocally:true,error:'Sauvegarde PostgreSQL échouée; la donnée est uniquement locale pour le moment'}); }
   res.status(201).json({ok:true,saved:true});
 });
-app.get('/api/health', (req,res) => res.json({ok:true, service:'MERCADO', time:new Date().toISOString()}));
+app.get('/api/health', (req,res) => res.json({ok:!persistenceError, service:'MERCADO', storage:dbReady?'postgresql':(dbPool?'postgresql-unavailable':'local-json-not-durable-on-render-free'), persistenceError:process.env.NODE_ENV==='production'?'':persistenceError, time:new Date().toISOString()}));
 app.get('/api/rates', async (req,res) => {
   const cached = readJson(RATE_CACHE_FILE, null);
   let rates = {EUR:1, XAF:655.957, XOF:655.957, USD:1.08, GBP:0.85, JPY:160, CNY:7.8, GHS:15, CAD:1.48, AUD:1.65, NZD:1.78, SGD:1.45, HKD:8.45, MXN:18};
@@ -306,16 +377,23 @@ app.get('/api/rates', async (req,res) => {
   else { try { const r=await fetch('https://open.er-api.com/v6/latest/EUR'); const d=await r.json(); if(r.ok&&d.rates) { rates={...rates,...d.rates,EUR:1,XAF:655.957,XOF:655.957}; writeJson(RATE_CACHE_FILE,{at:Date.now(),rates}); } } catch {} }
   res.json({base:'EUR', rates, updatedAt:cached?.at || Date.now()});
 });
-app.get('/api/catalog/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat || 'All', limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items}); } catch(e) { res.status(503).json({error:'Catalogue fournisseur temporairement indisponible'}); } });
-app.get('/api/catalog/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100), cat:req.query.cat||'All', limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)), page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items}); } catch(e) { res.status(503).json({error:'Recherche CJ temporairement indisponible'}); } });
-app.get('/api/catalog/cj/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat||'All',limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items}); } catch { res.status(503).json({error:'Catalogue CJ indisponible'}); } });
-app.get('/api/catalog/cj/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100),cat:req.query.cat||'All',limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)),page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items}); } catch { res.status(503).json({error:'Recherche CJ indisponible'}); } });
+function publicProduct(item) {
+  if (!item || typeof item !== 'object') return item;
+  const { supplierPriceUSD, ...safe } = item;
+  return safe;
+}
+function publicProducts(items) { return Array.isArray(items) ? items.map(publicProduct) : []; }
+
+app.get('/api/catalog/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat || 'All', limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items:publicProducts(items)}); } catch(e) { res.status(503).json({error:'Catalogue fournisseur temporairement indisponible'}); } });
+app.get('/api/catalog/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100), cat:req.query.cat||'All', limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)), page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items:publicProducts(items)}); } catch(e) { res.status(503).json({error:'Recherche CJ temporairement indisponible'}); } });
+app.get('/api/catalog/cj/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat||'All',limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items:publicProducts(items)}); } catch { res.status(503).json({error:'Catalogue CJ indisponible'}); } });
+app.get('/api/catalog/cj/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100),cat:req.query.cat||'All',limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)),page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items:publicProducts(items)}); } catch { res.status(503).json({error:'Recherche CJ indisponible'}); } });
 app.get('/api/catalog/item', async (req,res) => {
   const id=String(req.query.itemId||req.query.id||''); if(!id) return res.status(400).json({error:'itemId requis'});
-  try { const d=await cjRequest('/product/query',{pid:id},10); const p=d.data?.[0] || d.data?.product || d.data || d; const item=await toMercadoProduct(p); if(!item) return res.status(404).json({error:'Produit indisponible'}); res.json({...item,desc:p.description||p.descriptionEn||item.description, img:item.image}); }
+  try { const d=await cjRequest('/product/query',{pid:id},10); const p=d.data?.[0] || d.data?.product || d.data || d; const item=await toMercadoProduct(p); if(!item) return res.status(404).json({error:'Produit indisponible'}); res.json({...publicProduct(item),desc:p.description||p.descriptionEn||item.description, img:item.image}); }
   catch { res.status(503).json({error:'Détails du produit indisponibles'}); }
 });
-app.get('/api/catalog/cj/product/:id', async (req,res) => { try { const d=await cjRequest('/product/query',{pid:String(req.params.id)},10); const p=d.data?.[0] || d.data?.product || d.data || d; const item=await toMercadoProduct(p); if(!item) return res.status(404).json({error:'Produit indisponible'}); res.json({...item,desc:p.description||p.descriptionEn||item.description}); } catch { res.status(503).json({error:'Détails CJ indisponibles'}); } });
+app.get('/api/catalog/cj/product/:id', async (req,res) => { try { const d=await cjRequest('/product/query',{pid:String(req.params.id)},10); const p=d.data?.[0] || d.data?.product || d.data || d; const item=await toMercadoProduct(p); if(!item) return res.status(404).json({error:'Produit indisponible'}); res.json({...publicProduct(item),desc:p.description||p.descriptionEn||item.description}); } catch { res.status(503).json({error:'Détails CJ indisponibles'}); } });
 app.get('/api/catalog/cj/variants/:id', async (req,res) => { try { const d=await cjRequest('/product/variant/query',{pid:String(req.params.id)},10); res.json({ok:true,data:d.data||d}); } catch { res.status(503).json({error:'Variantes CJ indisponibles ou endpoint non activé sur ce compte'}); } });
 app.get('/api/catalog/cj/stock/:id', async (req,res) => { try { const d=await cjRequest('/product/stock/getInventoryByPid',{pid:String(req.params.id)},10); res.json({ok:true,data:d.data||d}); } catch { res.status(503).json({error:'Stock CJ indisponible; vérifiez le paramètre pid et les droits API'}); } });
 // Email-code verification removed: checkout no longer depends on Resend.
@@ -325,6 +403,17 @@ app.get('/api/admin/notifications', admin, (req,res) => {
   const all = readJson('notifications.json', []);
   res.json({ok:true,total:all.length,notifications:all.slice(-limit).reverse()});
 });
+app.get('/api/admin/orders', admin, async (req,res) => {
+  const orders = readJson(ordersFile, []);
+  try { await flushJsonToDb(ordersFile); } catch { return res.status(503).json({ok:false,error:'La sauvegarde durable est en erreur'}); }
+  res.json({ok:true,total:orders.length,orders:orders.slice(-500).reverse()});
+});
+app.get('/api/admin/inbox', admin, async (req,res) => {
+  const all = readJson('inbox.json', []);
+  try { await flushJsonToDb('inbox.json'); } catch { return res.status(503).json({ok:false,error:'La sauvegarde durable est en erreur'}); }
+  res.json({ok:true,total:all.length,items:all.slice(-500).reverse()});
+});
+
 app.post('/api/progress', async (req,res) => {
   const b = req.body || {};
   const stage = String(b.stage || '');
@@ -343,18 +432,41 @@ app.post('/api/progress', async (req,res) => {
 });
 
 app.post('/api/order', async (req,res) => {
-  const body=req.body||{}; if(!body.orderId || !Array.isArray(body.items)||!body.items.length) return res.status(400).json({error:'Commande invalide'});
-  const previouslySaved = orderList().some(x => x.orderId === String(body.orderId));
-  let totalEUR=0; const items=[];
+  const body=req.body||{};
+  const orderId=String(body.orderId||'').trim().slice(0,80);
+  if(!orderId || !Array.isArray(body.items)||!body.items.length) return res.status(400).json({error:'Commande invalide'});
+  const previouslySaved = orderList().some(x => x.orderId === orderId);
+  const clean = v => String(v ?? '').trim().slice(0,500);
+  const ci=body.customer&&typeof body.customer==='object'?body.customer:{};
+  const customer={name:clean(ci.name),email:clean(ci.email).toLowerCase(),phone:clean(ci.phone),alternatePhone:clean(ci.alternatePhone),address:clean(ci.address),neighborhood:clean(ci.neighborhood),landmark:clean(ci.landmark),city:clean(ci.city),zip:clean(ci.zip),recipientName:clean(ci.recipientName),deliveryInstructions:clean(ci.deliveryInstructions),country:clean(ci.country)};
+  const visitorId=String(body.visitorId||'').trim().slice(0,120);
+  const rawItems=body.items.slice(0,50).map(it=>({id:clean(it.id).slice(0,120),name:clean(it.name||it.title||it.id).slice(0,160),qty:Math.max(1,Math.min(50,Math.floor(Number(it.qty)||1))),clientPrice:Number(it.price)||0,itemUrl:clean(it.itemUrl||it.url).slice(0,500)}));
+  let totalEUR=0; const items=[]; let pricingValidated=true;
   try {
-    for(const it of body.items) { const id=String(it.id||''); if(!id) throw new Error('Invalid product'); const d=await cjRequest('/product/query',{pid:id},10); const p=d.data?.[0] || d.data?.product || d.data || d; const price=(productPriceUSD(p)+MARKUP)*await eurRate(); const qty=Math.max(1,Math.min(50,Math.floor(Number(it.qty)||1))); totalEUR += price*qty; items.push({id,name:p.productNameEn||p.nameEn||it.name||id,qty,priceEUR:Number(price.toFixed(2)),itemUrl:cjProductUrl(p)}); }
-  } catch { return res.status(503).json({error:'Impossible de recalculer les prix CJ. La commande n’a pas été validée.'}); }
-  const o={orderId:String(body.orderId),items,customer:body.customer||{},paymentMethod:body.paymentMethod||'',totalEUR:Number(totalEUR.toFixed(2)),status:'pending',createdAt:new Date().toISOString(),note:body.note||''}; saveOrder(o);
+    for(const it of rawItems) {
+      if(!it.id) throw new Error('Invalid product');
+      const d=await cjRequest('/product/query',{pid:it.id},10); const p=d.data?.[0] || d.data?.product || d.data || d;
+      const supplier=productPriceUSD(p); if(!(supplier>0)) throw new Error('CJ price unavailable');
+      const price=(supplier+MARKUP)*await eurRate(); const qty=it.qty; totalEUR += price*qty;
+      items.push({id:it.id,name:p.productNameEn||p.nameEn||it.name||it.id,qty,priceEUR:Number(price.toFixed(2)),itemUrl:cjProductUrl(p)});
+    }
+  } catch {
+    pricingValidated=false;
+    totalEUR=Number.isFinite(Number(body.total))?Number(body.total):0;
+    for(const it of rawItems) items.push({id:it.id,name:it.name,qty:it.qty,clientPrice:it.clientPrice,itemUrl:it.itemUrl});
+  }
+  const existing=orderList().find(x=>x.orderId===orderId)||{};
+  const status=existing.status || (pricingValidated?'pending':'price_validation_pending');
+  const o={...existing,orderId,visitorId,items,customer,paymentMethod:clean(body.paymentMethod).slice(0,60),totalEUR:Number(totalEUR.toFixed(2)),status,pricingValidated,createdAt:existing.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),note:clean(body.note||existing.note)};
+  saveOrder(o);
+  try { await flushJsonToDb(ordersFile); if(visitorId && /^[A-Za-z0-9._:-]{8,120}$/.test(visitorId)) await updateInboxOrder(o); }
+  catch { return res.status(503).json({ok:false,error:'Commande capturée localement mais la sauvegarde durable a échoué',orderId,status:o.status}); }
   if(!previouslySaved) {
     recordProgress({stage:'order_created',orderId:o.orderId,customer:o.customer,extra:{paymentMethod:o.paymentMethod,itemCount:o.items.length}});
     try { await telegram(formatOrderMessage(o)); } catch(e) { /* order is stored even if Telegram is unavailable */ }
   }
-  res.json({ok:true,orderId:o.orderId,totalEUR:o.totalEUR,status:o.status});
+  if(!pricingValidated) return res.status(202).json({ok:true,saved:true,orderId:o.orderId,totalEUR:o.totalEUR,status:o.status,pricingValidated:false,message:'La demande est enregistrée; les prix fournisseur doivent être vérifiés avant de confirmer le paiement.'});
+  res.json({ok:true,saved:true,orderId:o.orderId,totalEUR:o.totalEUR,status:o.status,pricingValidated:true});
 });
 async function camerpayPaymentHandler(req,res) {
   if(!process.env.CAMERPAY_TOKEN) return res.status(503).json({code:'payment_pending',error:'Paiement bientôt disponible'});
@@ -364,22 +476,37 @@ async function camerpayPaymentHandler(req,res) {
     for(const it of body.items) { const id=String(it.id||''); const d=await cjRequest('/product/query',{pid:id},10); const p=d.data?.[0] || d.data?.product || d.data || d; const price=(productPriceUSD(p)+MARKUP)*await eurRate(); const qty=Math.max(1,Math.min(50,Math.floor(Number(it.qty)||1))); totalEUR+=price*qty; items.push({id,name:p.productNameEn||p.nameEn||it.name||id,qty,priceEUR:Number(price.toFixed(2)),itemUrl:cjProductUrl(p)}); }
     const totalXAF=Math.round(totalEUR*Number(process.env.EUR_RATE||655.957));
     const orders=orderList(); let o=orders.find(x=>x.orderId===String(body.orderId));
-    o={...(o||{}),orderId:String(body.orderId),items,customer:body.customer||{},paymentMethod:body.paymentMethod||'',totalEUR:Number(totalEUR.toFixed(2)),totalXAF,status:'pending',createdAt:o?.createdAt||new Date().toISOString()}; saveOrder(o);
+    o={...(o||{}),orderId:String(body.orderId),visitorId:String(body.visitorId||o?.visitorId||''),items,customer:body.customer||{},paymentMethod:body.paymentMethod||'',totalEUR:Number(totalEUR.toFixed(2)),totalXAF,status:'pending',pricingValidated:true,createdAt:o?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()}; saveOrder(o); await flushJsonToDb(ordersFile); await updateInboxOrder(o);
     const base=(process.env.CAMERPAY_BASE_URL||'https://camerpay.biz/api').replace(/\/$/,''); const endpoint=(process.env.CAMERPAY_INITIATE_PATH||'/payment/initiate').startsWith('/')?(process.env.CAMERPAY_INITIATE_PATH||'/payment/initiate'):`/${process.env.CAMERPAY_INITIATE_PATH}`;
     const payload={amount:totalXAF,currency:process.env.CAMERPAY_CURRENCY||'XAF',customer_phone:o.customer.phone||'',customer_name:o.customer.name||'',customer_email:o.customer.email||'',merchant_invoice_id:o.orderId,merchant_callback_url:`${process.env.PUBLIC_BASE_URL}/api/payment/camerpay/webhook`,merchant_return_url:`${process.env.PUBLIC_BASE_URL}/?orderId=${encodeURIComponent(o.orderId)}#confirm`};
     if(process.env.CAMERPAY_METHOD) payload.payment_method=process.env.CAMERPAY_METHOD;
     const r=await fetch(base+endpoint,{method:'POST',headers:{Authorization:`Bearer ${process.env.CAMERPAY_TOKEN}`,'Content-Type':'application/json'},body:JSON.stringify(payload)}); const d=await r.json().catch(()=>({}));
-    if(!r.ok||d.success===false||!(d.pay_url||d.redirect_url||d.payment_url)) return res.status(502).json({error:d.message||`CamerPay a refusé la demande (HTTP ${r.status})`,providerStatus:r.status});
-    o.transactionUuid=d.transaction_uuid||d.uuid||d.transaction?.uuid||''; o.status=d.status||'pending'; saveOrder(o);
+    if(!r.ok||d.success===false||!(d.pay_url||d.redirect_url||d.payment_url)) {
+      o.status='payment_failed'; o.paymentProviderStatus=String(d.status||r.status); o.updatedAt=new Date().toISOString(); saveOrder(o); await flushJsonToDb(ordersFile); await updateInboxOrder(o);
+      return res.status(502).json({error:d.message||`CamerPay a refusé la demande (HTTP ${r.status})`,providerStatus:r.status});
+    }
+    o.transactionUuid=d.transaction_uuid||d.uuid||d.transaction?.uuid||''; o.status=o.status==='paid'?'paid':(d.status||'pending'); o.updatedAt=new Date().toISOString(); saveOrder(o); await flushJsonToDb(ordersFile); await updateInboxOrder(o);
     try { await telegram(formatOrderMessage(o, process.env.CAMERPAY_MODE==='test')); } catch {}
     res.json({ok:true,payment_url:d.pay_url||d.redirect_url||d.payment_url,orderId:o.orderId,status:o.status,totalXAF});
-  } catch(e) { res.status(502).json({error:'Impossible de créer le paiement CamerPay. Vérifiez le token, les chemins API et les logs du fournisseur.'}); }
+  } catch(e) {
+    try {
+      const fallbackBody=req.body||{};
+      const fallbackId=String(fallbackBody.orderId||'').trim();
+      if(fallbackId) {
+        const fallbackExisting=orderList().find(x=>x.orderId===fallbackId)||{};
+        const fallbackItems=Array.isArray(fallbackBody.items)?fallbackBody.items.slice(0,50).map(it=>({id:String(it.id||'').slice(0,120),name:String(it.name||it.id||'').slice(0,160),qty:Math.max(1,Math.min(50,Math.floor(Number(it.qty)||1))),itemUrl:String(it.itemUrl||it.url||'').slice(0,500)})):[];
+        const fallbackOrder={...fallbackExisting,orderId:fallbackId,visitorId:String(fallbackBody.visitorId||fallbackExisting.visitorId||''),items:fallbackItems,customer:fallbackBody.customer||fallbackExisting.customer||{},paymentMethod:String(fallbackBody.paymentMethod||''),totalEUR:Number(fallbackBody.total)||fallbackExisting.totalEUR||0,status:'payment_failed',pricingValidated:false,updatedAt:new Date().toISOString(),createdAt:fallbackExisting.createdAt||new Date().toISOString(),paymentProviderStatus:'initiation_error'};
+        saveOrder(fallbackOrder); await flushJsonToDb(ordersFile); await updateInboxOrder(fallbackOrder);
+      }
+    } catch(persistErr) { console.error('MERCADO failed-payment record could not be persisted:',persistErr.message); }
+    res.status(502).json({error:'Impossible de créer le paiement CamerPay. La demande est conservée si la sauvegarde a réussi; vérifiez le token, les chemins API et les logs du fournisseur.'});
+  }
 }
 app.post('/api/payment/camerpay', camerpayPaymentHandler);
 // Backward-compatible alias for older frontend settings that still use the old route name.
 app.post('/api/payment/flutterwave', camerpayPaymentHandler);
 
-app.post('/api/payment/camerpay/webhook', (req,res) => {
+app.post('/api/payment/camerpay/webhook', async (req,res) => {
   const b=req.body||{}; const uuid=String(b.uuid||''); const invoice=String(b.invoice_id||''); const status=String(b.status||''); const amount=String(b.amount||''); const signature=String(req.get('X-CamerPay-Signature')||b.signature||''); const secret=process.env.CAMERPAY_CALLBACK_SECRET||'';
   if(!secret) return res.status(503).send('Callback secret not configured');
   const expected=crypto.createHmac('sha256',secret).update(`${uuid}|${invoice}|${status}|${amount}`).digest('hex');
@@ -388,7 +515,7 @@ app.post('/api/payment/camerpay/webhook', (req,res) => {
   const o=orders[idx]; const wasAlreadyPaid=o.status==='paid'; const received=Number(amount); if(!Number.isFinite(received)||Math.abs(received-Number(o.totalXAF||0))>0.01) return res.status(400).send('Amount mismatch');
   if(status==='completed') { o.status='paid'; o.paidAt=o.paidAt||new Date().toISOString(); }
   else if(['failed','cancelled','refunded'].includes(status)) o.status=status;
-  o.transactionUuid=uuid||o.transactionUuid; orders[idx]=o; writeJson(ordersFile,orders);
+  o.transactionUuid=uuid||o.transactionUuid; o.updatedAt=new Date().toISOString(); orders[idx]=o; writeJson(ordersFile,orders); try { await flushJsonToDb(ordersFile); await updateInboxOrder(o); } catch { return res.status(503).send('Persistence unavailable; retry callback'); }
   if(status==='completed' && !wasAlreadyPaid) {
     recordProgress({stage:'payment_paid',orderId:o.orderId,customer:o.customer,extra:{paymentMethod:o.paymentMethod,providerStatus:status}});
     telegram(formatOrderMessage(o,false).replace('Statut: paid','Statut: PAYE')).catch(()=>{});
@@ -406,7 +533,7 @@ app.get('/api/payment/camerpay/status', async (req,res) => {
     if(s==='completed') {
       const latest=orderList().find(x=>x.orderId===orderId);
       if(latest?.status!=='paid') {
-        o.status='paid'; o.paidAt=o.paidAt||new Date().toISOString(); saveOrder(o);
+        o.status='paid'; o.paidAt=o.paidAt||new Date().toISOString(); o.updatedAt=new Date().toISOString(); saveOrder(o); await flushJsonToDb(ordersFile); await updateInboxOrder(o);
         recordProgress({stage:'payment_paid',orderId:o.orderId,customer:o.customer,extra:{paymentMethod:o.paymentMethod,providerStatus:'completed'}});
         telegram(formatOrderMessage(o,false).replace('Statut: paid','Statut: PAYE')).catch(()=>{});
         if(o.customer?.email) sendEmail(o.customer.email,'Confirmation de commande MERCADO',`<p>Bonjour ${String(o.customer.name||'').replace(/[<>]/g,'')},</p><p>Votre paiement pour la commande ${o.orderId} a été confirmé.</p><p>Total payé : ${o.totalXAF} XAF.</p>`).catch(()=>{});
@@ -492,10 +619,10 @@ app.post('/api/ai', async (req,res)=>{
 app.post('/api/ai-log', (req,res)=>res.json({ok:true}));
 app.get('/api/admin/cj/status', admin, (req,res)=>{ resetPointsIfNeeded(); res.json({ok:true,tokenPresent:!!cjToken||!!process.env.CJ_ACCESS_TOKEN,apiKeyPresent:!!process.env.CJ_API_KEY,pointsDate:cjPoints.date,pointsUsed:cjPoints.used,pointsLimit:POINT_LIMIT,cacheEntries:productCache.size}); });
 app.get('/api/admin/cj/raw', admin, async (req,res)=>{ try { const d=await cjRequest('/product/listV2',{keyWord:String(req.query.q||''),page:1,size:10,orderBy:1,sort:'desc',features:'enable_category'},50); res.json(d); } catch { res.status(502).json({error:'CJ request failed'}); } });
-app.get('/api/admin/diagnostics', admin, (req,res)=>res.json({ok:true,env:{cjApiKey:!!process.env.CJ_API_KEY,cjAccessToken:!!cjToken,camerpayToken:!!process.env.CAMERPAY_TOKEN,camerpayCallbackSecret:!!process.env.CAMERPAY_CALLBACK_SECRET,resendApiKey:!!process.env.RESEND_API_KEY,resendFrom:process.env.RESEND_FROM||'MERCADO <onboarding@resend.dev>',resendUsesTestSender:!process.env.RESEND_FROM||process.env.RESEND_FROM.toLowerCase().includes('onboarding@resend.dev'),telegramBotToken:!!process.env.TELEGRAM_BOT_TOKEN,telegramChatId:!!process.env.TELEGRAM_CHAT_ID,anthropicApiKey:!!process.env.ANTHROPIC_API_KEY},lastMailError,dataDir:DATA_DIR}));
+app.get('/api/admin/diagnostics', admin, (req,res)=>res.json({ok:true,storage:dbReady?'postgresql':(dbPool?'postgresql-unavailable':'local-json-not-durable-on-render-free'),persistenceError:!!persistenceError,env:{databaseUrl:!!process.env.DATABASE_URL,postgresReady:dbReady,cjApiKey:!!process.env.CJ_API_KEY,cjAccessToken:!!cjToken,camerpayToken:!!process.env.CAMERPAY_TOKEN,camerpayCallbackSecret:!!process.env.CAMERPAY_CALLBACK_SECRET,resendApiKey:!!process.env.RESEND_API_KEY,resendFrom:process.env.RESEND_FROM||'MERCADO <onboarding@resend.dev>',resendUsesTestSender:!process.env.RESEND_FROM||process.env.RESEND_FROM.toLowerCase().includes('onboarding@resend.dev'),telegramBotToken:!!process.env.TELEGRAM_BOT_TOKEN,telegramChatId:!!process.env.TELEGRAM_CHAT_ID,anthropicApiKey:!!process.env.ANTHROPIC_API_KEY},lastMailError,dataDir:DATA_DIR}));
 app.get('/api/admin/test-telegram', admin, async (req,res)=>{ try { await telegram('✅ Test MERCADO Telegram : connexion opérationnelle.'); res.json({ok:true}); } catch { res.status(502).json({ok:false,error:'Telegram test failed'}); } });
 app.get('/api/admin/test-camerpay', admin, async (req,res)=>{ if(!process.env.CAMERPAY_TOKEN) return res.status(503).json({ok:false,error:'CAMERPAY_TOKEN manquant'}); res.json({ok:true,tokenConfigured:true,baseUrl:process.env.CAMERPAY_BASE_URL||'https://camerpay.biz/api',initiatePath:process.env.CAMERPAY_INITIATE_PATH||'/payment/initiate',statusPath:process.env.CAMERPAY_STATUS_PATH||'/payment/{id}/status',note:'Le test de connexion réel nécessite une transaction sandbox autorisée par CamerPay.'}); });
 app.get('/api/admin/test-resend', admin, async (req,res)=>{ try { const d=await sendEmail(String(req.query.to||'delivered@resend.dev'),'Test MERCADO Resend', '<p>Test de livraison Resend.</p>'); res.json({ok:true,id:d.id,to:req.query.to||'delivered@resend.dev',note:'Vérifiez Resend > Emails pour l’état delivered/bounced.'}); } catch(e) { res.status(502).json({ok:false,error:'Resend test failed',details:e.message}); } });
 
 app.get('*', (req,res) => res.sendFile(path.join(PUBLIC_DIR,'index.html')));
-app.listen(PORT, () => console.log(`MERCADO server listening on ${PORT}`));
+initializePersistence().then(() => { app.listen(PORT, () => console.log(`MERCADO server listening on ${PORT}; storage=${dbReady?'postgresql':'local-json'}`)); }).catch(err => { persistenceError=err.message; console.error('MERCADO PostgreSQL initialization failed:', err.message); if (process.env.REQUIRE_DATABASE === 'true') process.exit(1); app.listen(PORT, () => console.log(`MERCADO server listening on ${PORT}; WARNING: PostgreSQL unavailable, JSON fallback is not durable on Render Free`)); });
