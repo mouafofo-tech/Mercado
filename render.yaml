@@ -1,0 +1,26 @@
+
+services:
+  - type: web
+    name: mercado
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: PRICE_MARKUP_USD
+        value: "10"
+      - key: PGSSL
+        value: "true"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CAMERPAY_CALLBACK_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
