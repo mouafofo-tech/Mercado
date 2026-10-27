@@ -237,21 +237,36 @@ async function getCatalog({cat='All', q='', limit=60, page=1}={}) {
     queryTerms.push('sports shoes', 'running shoes', 'basketball sneakers');
   }
   // Search across CJ's supplier catalogue using several related terms; results remain limited to products returned by CJ.
-  const terms = q ? [...new Set(queryTerms)].slice(0, 6) : (cat === 'Electronics' ? electronicsTerms : [cat !== 'All' ? CATEGORY_KEYWORDS[cat] || cat : '']);
+  // IMPORTANT: CJ's product/listV2 can return an empty list for a blank keyWord.
+  // For the home page, use real broad terms instead of sending an empty search.
+  const allTerms = ['fashion','phone','headphones','home decor','beauty','sports','watch','computer','toys'];
+  const terms = q
+    ? [...new Set(queryTerms)].slice(0, 6)
+    : cat === 'Electronics'
+      ? electronicsTerms
+      : cat === 'All'
+        ? allTerms
+        : [CATEGORY_KEYWORDS[cat] || cat];
   const rowsById = new Map();
+  let successfulSearches = 0;
   for (const term of terms) {
     try {
       const d = await cjRequest('/product/listV2', { keyWord:term, page, size:100, orderBy:1, sort:'desc', features:'enable_category' }, 50);
       let rows = unwrapList(d);
       if (!rows.length && d.data && Array.isArray(d.data.products)) rows = d.data.products;
+      successfulSearches++;
+      console.info(`[CJ catalog] term=${JSON.stringify(term)} rows=${rows.length}`);
       for (const p of rows) {
         const id = String(p.pid || p.productId || p.id || p.productSku || '');
         if (id && !rowsById.has(id)) rowsById.set(id, p);
       }
     } catch (err) {
-      // Keep usable results from other terms if one supplier search fails.
+      // Log the error message but never log API keys or access tokens.
+      console.error(`[CJ catalog] search failed for term=${JSON.stringify(term)}: ${String(err.message || err).slice(0,240)}`);
     }
   }
+  console.info(`[CJ catalog] category=${JSON.stringify(cat)} searchesOk=${successfulSearches}/${terms.length} uniqueRows=${rowsById.size}`);
+  if (successfulSearches === 0) throw new Error('All CJ product searches failed; inspect the safe CJ catalog logs above');
 
   const mapped = [];
   for (const p of rowsById.values()) {
@@ -265,6 +280,7 @@ async function getCatalog({cat='All', q='', limit=60, page=1}={}) {
   const candidateCount = Math.min(mapped.length, Math.max(limit * 3, Number(process.env.MIN_PRODUCTS_PER_CATEGORY || 60)));
   const popularPool = mapped.sort((a,b) => (b.sold-a.sold) || (b.supplierPriceUSD-a.supplierPriceUSD)).slice(0, candidateCount);
   let result = mixPriceRanges(popularPool, limit);
+  console.info(`[CJ catalog] mapped=${mapped.length} returned=${result.length} category=${JSON.stringify(cat)}`);
   if (q) {
     const wanted = lowerQuery.split(/[^a-z0-9]+/).filter(Boolean);
     const score = item => {
@@ -384,7 +400,7 @@ function publicProduct(item) {
 }
 function publicProducts(items) { return Array.isArray(items) ? items.map(publicProduct) : []; }
 
-app.get('/api/catalog/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat || 'All', limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items:publicProducts(items)}); } catch(e) { res.status(503).json({error:'Catalogue fournisseur temporairement indisponible'}); } });
+app.get('/api/catalog/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat || 'All', limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items:publicProducts(items)}); } catch(e) { console.error('[CJ catalog] home endpoint failed:', String(e.message || e).slice(0,240)); res.status(503).json({error:'Catalogue fournisseur temporairement indisponible'}); } });
 app.get('/api/catalog/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100), cat:req.query.cat||'All', limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)), page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items:publicProducts(items)}); } catch(e) { res.status(503).json({error:'Recherche CJ temporairement indisponible'}); } });
 app.get('/api/catalog/cj/home', async (req,res) => { try { const items=await getCatalog({cat:req.query.cat||'All',limit:Math.min(200,Math.max(1,Number(req.query.limit)||60))}); res.json({ok:true,items:publicProducts(items)}); } catch { res.status(503).json({error:'Catalogue CJ indisponible'}); } });
 app.get('/api/catalog/cj/search', async (req,res) => { try { const items=await getCatalog({q:String(req.query.q||'').slice(0,100),cat:req.query.cat||'All',limit:Math.min(100,Math.max(1,Number(req.query.limit)||60)),page:Math.max(1,Number(req.query.page)||1)}); res.json({ok:true,items:publicProducts(items)}); } catch { res.status(503).json({error:'Recherche CJ indisponible'}); } });
